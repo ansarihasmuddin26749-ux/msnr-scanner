@@ -1,14 +1,15 @@
 """
-context_scanner_v2.py - Multi-pair MSNR scanner
+context_scanner_v2.py - Multi-pair MSNR scanner (conflict-free)
 Pairs: BTCUSDT | XAUUSDT (Gold) | NAS100USDT (US100)
 
-Same concepts on all:
-  Classic A/V, OCL, SBR/RBS, QML, IDM, Asia Sweep, FVG, SHIFT LTF
+Rules to avoid Buy+Sell same zone:
+  1. Recent 5m SHIFT direction is boss → only that side alerts
+  2. Opposite signal blocked within 0.8% price distance
+  3. Only one alert per level per side per day
+  4. Touch-only alerts are weaker; full SHIFT alerts preferred
 
 Needs:  pip install matplotlib pandas numpy
 Run:    $env:NTFY_TOPIC="hasmuddin-btc-8f3k2"
-        python context_scanner_v2.py --demo
-        python context_scanner_v2.py --once
         python context_scanner_v2.py
 """
 import argparse
@@ -22,34 +23,18 @@ from datetime import datetime, timezone
 import pandas as pd
 from chart_reasons import render_setup_chart
 
-# ---------------------------------------------------------------- multi-pair config
 PAIRS = {
     "BTCUSDT": {
-        "symbol": "BTCUSDT",
-        "label": "BTC",
-        "decimals": 1,
-        "unit": "pts",
-        "tf_chart": "5m",
-        "min_risk": 0.001,
-        "sl_buffer": 0.0005,
+        "symbol": "BTCUSDT", "label": "BTC", "decimals": 1, "unit": "pts",
+        "tf_chart": "5m", "min_risk": 0.001, "sl_buffer": 0.0005,
     },
     "XAUUSDT": {
-        "symbol": "XAUUSDT",          # Binance gold
-        "label": "GOLD",
-        "decimals": 2,
-        "unit": "pts",
-        "tf_chart": "5m",
-        "min_risk": 0.0008,
-        "sl_buffer": 0.0004,
+        "symbol": "XAUUSDT", "label": "GOLD", "decimals": 2, "unit": "pts",
+        "tf_chart": "5m", "min_risk": 0.0008, "sl_buffer": 0.0004,
     },
     "NAS100USDT": {
-        "symbol": "NAS100USDT",       # US100 / NAS100 on Binance
-        "label": "US100",
-        "decimals": 1,
-        "unit": "pts",
-        "tf_chart": "5m",
-        "min_risk": 0.001,
-        "sl_buffer": 0.0005,
+        "symbol": "NAS100USDT", "label": "US100", "decimals": 1, "unit": "pts",
+        "tf_chart": "5m", "min_risk": 0.001, "sl_buffer": 0.0005,
     },
 }
 
@@ -58,16 +43,16 @@ HOSTS = [
     "https://data-api.binance.vision",
     "https://api1.binance.com",
     "https://api2.binance.com",
-    "https://fapi.binance.com",       # futures (some pairs only here)
+    "https://fapi.binance.com",
 ]
 STATE_FILE = "context_state.json"
 TOL = 0.0015
 PIVOT_1H = 3
 PIVOT_5M = 2
 LOOKBACK_1H = 400
+OPPOSITE_BLOCK_PCT = 0.008   # 0.8% — opposite signal blocked inside this range
 
 
-# ---------------------------------------------------------------- data
 def _get(path, params, futures=False):
     q = urllib.parse.urlencode(params)
     last = None
@@ -89,14 +74,10 @@ def klines(symbol, interval, limit, futures=False):
     try:
         raw = _get(path, {"symbol": symbol, "interval": interval, "limit": limit}, futures=futures)
     except Exception:
-        # fallback: try the other market
         path2 = "/api/v3/klines" if futures else "/fapi/v1/klines"
         raw = _get(path2, {"symbol": symbol, "interval": interval, "limit": limit}, futures=not futures)
-    return [
-        {"t": k[0]//1000, "o": float(k[1]), "h": float(k[2]),
-         "l": float(k[3]), "c": float(k[4])}
-        for k in raw[:-1]
-    ]
+    return [{"t": k[0]//1000, "o": float(k[1]), "h": float(k[2]),
+             "l": float(k[3]), "c": float(k[4])} for k in raw[:-1]]
 
 
 def bars_to_df(bars):
@@ -106,7 +87,6 @@ def bars_to_df(bars):
     return df.reset_index(drop=True)
 
 
-# ---------------------------------------------------------------- MSNR detection (same for all pairs)
 def pivots_close(bars, n):
     res = []
     for i in range(n, len(bars) - n):
@@ -305,6 +285,39 @@ def utc(ts, f="%d %b %H:%M"):
     return datetime.fromtimestamp(ts, timezone.utc).strftime(f) + " UTC"
 
 
+# ---------- CONFLICT CONTROL ----------
+def is_opposite_blocked(state, symbol, side, price, now_ts):
+    """
+    Block opposite-side alert if we recently sent a signal
+    within OPPOSITE_BLOCK_PCT of this price.
+    """
+    want_opposite = "SHORT" if side == "LONG" else "LONG"
+    window = 6 * 3600  # last 6 hours
+    for k, ts in state.items():
+        if not k.startswith(f"{symbol}:"):
+            continue
+        if abs(now_ts - ts) > window:
+            continue
+        # key formats: symbol:shift:KIND:price:ts  or symbol:touch:...
+        parts = k.split(":")
+        if len(parts) < 4:
+            continue
+        # find if this key was opposite side
+        if "shift" in k or "touch" in k:
+            try:
+                lvl_price = float(parts[3])
+            except Exception:
+                continue
+            if abs(lvl_price - price) / price < OPPOSITE_BLOCK_PCT:
+                # check stored side hint
+                if f":{want_opposite}" in k or want_opposite.lower() in k:
+                    return True
+                # also block if any recent opposite exists nearby
+                if "shift" in k:
+                    return True
+    return False
+
+
 def build_setup(side, lv, price, plan, bars5, asia, fvgs, shift_idx, extreme, cfg,
                 ocl=None, idm=None, qml=None, flips=None):
     is_long = side == "long"
@@ -324,10 +337,8 @@ def build_setup(side, lv, price, plan, bars5, asia, fvgs, shift_idx, extreme, cf
 
     setup = {
         "side": "LONG" if is_long else "SHORT",
-        "symbol": cfg["symbol"],
-        "tf": cfg["tf_chart"],
-        "decimals": dec,
-        "unit": cfg["unit"],
+        "symbol": cfg["symbol"], "tf": cfg["tf_chart"],
+        "decimals": dec, "unit": cfg["unit"],
         "entry": plan["entry"], "sl": plan["sl"], "tp": plan["tp2"],
         "entry_idx": len(bars5)-1,
         "level": {"price": lv["price"], "label": label},
@@ -365,7 +376,6 @@ def build_setup(side, lv, price, plan, bars5, asia, fvgs, shift_idx, extreme, cf
     return setup
 
 
-# ---------------------------------------------------------------- send
 def send(title, short, png_path=None, full_text=None):
     print(title + " | " + short + "\n" + "-"*50)
     topic = os.getenv("NTFY_TOPIC")
@@ -405,21 +415,21 @@ def load_state():
 
 
 def save_state(s):
-    keys = sorted(s)[-500:]
+    keys = sorted(s)[-600:]
     with open(STATE_FILE, "w") as f:
         json.dump({k:s[k] for k in keys}, f)
 
 
-FOOTER = ("MSNR map (BTC + GOLD + US100): Classic A/V + OCL + SBR/RBS + QML + IDM + Asia + FVG + SHIFT. "
-          "No proven edge (~0R). You decide.")
+FOOTER = ("MSNR map (BTC+GOLD+US100). Direction locked by 5m SHIFT. "
+          "Opposite signals blocked in same zone. No proven edge. You decide.")
 
 
-# ---------------------------------------------------------------- scan one pair
 def scan_pair(cfg, state):
     symbol = cfg["symbol"]
     label  = cfg["label"]
     dec    = cfg["decimals"]
     sent   = 0
+    now_ts = int(time.time())
 
     try:
         b1 = klines(symbol, "1h", LOOKBACK_1H+1)
@@ -440,11 +450,20 @@ def scan_pair(cfg, state):
     pivs    = pivots_close(b1, PIVOT_1H)
     flips   = detect_sbr_rbs(b1, pivs)
     qmls    = detect_qml(b1, PIVOT_1H)
-    direction, brk, shift_idx = shift_5m(b5)
+    direction, brk, shift_idx = shift_5m(b5)   # "bull" / "bear" / None
     asia    = asia_status(b5)
     fvgs    = open_fvgs(b1)
     recent  = b5[-12:]
     day_hour = datetime.fromtimestamp(b5[-1]["t"], timezone.utc).strftime("%Y%m%d%H")
+
+    # ----- DIRECTION LOCK -----
+    # If we have a clear 5m shift, only allow that side.
+    # If no shift, we still allow touch alerts but mark them weaker.
+    locked_side = None
+    if direction == "bull":
+        locked_side = "LONG"
+    elif direction == "bear":
+        locked_side = "SHORT"
 
     levels = classic[:]
     for o in ocls[-8:]:
@@ -459,15 +478,27 @@ def scan_pair(cfg, state):
     for lv in touched:
         kind = lv.get("kind", "V")
         is_v = kind in ("V","RBS") or (kind=="OCL" and lv.get("bull")) or (kind=="QML" and lv.get("side")=="bull")
+        side_str = "LONG" if is_v else "SHORT"
         name = {"V":"Classic V","A":"Classic A","OCL":"OCL","SBR":"SBR","RBS":"RBS","QML":"QML"}.get(kind, kind)
         want = "bull" if is_v else "bear"
         extreme = min(b["l"] for b in recent) if is_v else max(b["h"] for b in recent)
         idm = detect_idm(b5, direction, brk)
 
+        # ----- CONFLICT FILTERS -----
+        # 1. Direction lock: if shift exists, only same side
+        if locked_side and side_str != locked_side:
+            continue
+
+        # 2. Opposite zone block
+        if is_opposite_blocked(state, symbol, side_str, lv["price"], now_ts):
+            continue
+
         reasons = [
             f"{label} 1h {name} at {fmt(lv['price'],dec)} ({utc(lv.get('t', b5[-1]['t']))}).",
             f"5m wick reached ({'low' if is_v else 'high'} {fmt(extreme,dec)}).",
         ]
+        if locked_side:
+            reasons.append(f"Direction locked by 5m SHIFT → only {locked_side} allowed.")
         if asia:
             if is_v and asia.get("swept_low"): reasons.append(f"Asia low {fmt(asia['low'],dec)} swept.")
             if not is_v and asia.get("swept_high"): reasons.append(f"Asia high {fmt(asia['high'],dec)} swept.")
@@ -479,11 +510,12 @@ def scan_pair(cfg, state):
                 reasons.append(f"Inside FVG {fmt(f['bottom'],dec)}-{fmt(f['top'],dec)}.")
                 break
 
-        key = f"{symbol}:touch:{kind}:{round(lv['price'], dec)}:{day_hour}"
-        if key not in state:
-            state[key] = int(time.time())
-            r = reasons + [f"Waiting for 5m shift {'up' if is_v else 'down'}."]
-            setup = {"side":"LONG" if is_v else "SHORT", "symbol":symbol, "tf":cfg["tf_chart"],
+        # --- Touch alert (only if NO direction lock yet, to reduce noise) ---
+        key = f"{symbol}:touch:{side_str}:{kind}:{round(lv['price'],dec)}:{day_hour}"
+        if key not in state and locked_side is None:
+            state[key] = now_ts
+            r = reasons + ["No SHIFT yet — waiting for confirmation. Touch only."]
+            setup = {"side": side_str, "symbol":symbol, "tf":cfg["tf_chart"],
                      "decimals":dec, "unit":cfg["unit"],
                      "entry":price, "sl":price*(0.997 if is_v else 1.003),
                      "tp":price*(1.006 if is_v else 0.994), "entry_idx":len(b5)-1,
@@ -497,12 +529,13 @@ def scan_pair(cfg, state):
                     df5, setup, r, FOOTER)
             sent += 1
 
+        # --- Full SHIFT alert (main signal) ---
         if direction == want:
-            skey = f"{symbol}:shift:{kind}:{round(lv['price'],dec)}:{b5[-1]['t']}"
+            skey = f"{symbol}:shift:{side_str}:{kind}:{round(lv['price'],dec)}:{b5[-1]['t']}"
             if skey not in state:
-                state[skey] = int(time.time())
+                state[skey] = now_ts
                 plan = make_plan("long" if is_v else "short", recent, price, levels, cfg)
-                r = reasons + [f"5m closed {'above' if is_v else 'below'} {fmt(brk,dec)} → SHIFT.",
+                r = reasons + [f"5m closed {'above' if is_v else 'below'} {fmt(brk,dec)} → SHIFT confirmed.",
                                f"SL beyond {fmt(extreme,dec)}."]
                 nearest_ocl = ocls[-1] if ocls else None
                 nearest_qml = next((q for q in reversed(qmls) if (q.get("side")=="bull")==is_v), None)
@@ -515,14 +548,14 @@ def scan_pair(cfg, state):
                         df5, setup, r, FOOTER)
                 sent += 1
 
-    # Asia context
+    # Asia context (no direction, just info)
     if asia and datetime.now(timezone.utc).hour >= 8:
         d = datetime.now(timezone.utc).strftime("%Y%m%d")
         for flag, nm, p in ((asia.get("swept_high"),"HIGH",asia["high"]),
                             (asia.get("swept_low"),"LOW",asia["low"])):
             key = f"{symbol}:asia_{nm}:{d}"
             if flag and key not in state:
-                state[key] = int(time.time())
+                state[key] = now_ts
                 setup = {"side":"LONG","symbol":symbol,"tf":cfg["tf_chart"],
                          "decimals":dec, "unit":cfg["unit"],
                          "entry":price,"sl":price*0.997,"tp":price*1.006,
@@ -559,7 +592,7 @@ def demo():
     from chart_reasons import _demo
     path = _demo(out="demo_alert.png")
     send("DEMO FULL MSNR CHART",
-         "BTC + GOLD + US100 | Classic V + OCL + IDM + QML + SBR + Asia + FVG + SHIFT",
+         "Conflict-free | Direction locked by SHIFT | BTC+GOLD+US100",
          png_path=path)
 
 
