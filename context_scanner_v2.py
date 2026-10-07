@@ -12,6 +12,20 @@ Needs:  pip install matplotlib pandas numpy
 Run:    $env:NTFY_TOPIC="hasmuddin-btc-8f3k2"
         python context_scanner_v2.py
 """
+import http.server
+import socketserver
+import threading
+import os
+def start_fake_server():
+    PORT = int(os.environ.get("PORT", 8080))
+    Handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        httpd.serve_forever()
+
+# बैकग्राउंड में वेब सर्वर शुरू करने के लिए thread का उपयोग करें
+threading.Thread(target=start_fake_server, daemon=True).start()
+
+
 import argparse
 import json
 import os
