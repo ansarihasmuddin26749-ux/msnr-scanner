@@ -40,7 +40,7 @@ def load_csv(path):
     if tcol is None:
         raise SystemExit("no time column found")
     t = df[tcol]
-    if np.issubdtype(t.dtype, np.number):
+    if pd.api.types.is_numeric_dtype(t):
         unit = "ms" if float(t.iloc[0]) > 1e11 else "s"
         t = pd.to_datetime(t, unit=unit, utc=True)
     else:
@@ -228,6 +228,10 @@ def main():
         ltf = shuffle_bars(ltf, a.seed)
     targets = (1, 2, 3)
     df, nsig = run(ltf, a.htf, a.k, a.fee, targets, a.tz)
+
+    # Filter: Only Longs + only Q2 & Q4
+    df = df[(df.side == "L") & (df.q.isin([2, 4]))]
+
     print(f"bars={len(ltf)}  HTF touch signals={nsig}  trades={len(df)}  "
           f"{'SHUFFLED' if a.shuffle else 'REAL'}  fee/side={a.fee}")
     if df.empty:
