@@ -27,14 +27,17 @@ PAIRS = {
     "BTCUSDT": {
         "symbol": "BTCUSDT", "label": "BTC", "decimals": 1, "unit": "pts",
         "tf_chart": "5m", "min_risk": 0.001, "sl_buffer": 0.0005,
+        "smt_pair": "ETHUSDT",  # BTC vs ETH
     },
     "XAUUSDT": {
         "symbol": "XAUUSDT", "label": "GOLD", "decimals": 2, "unit": "pts",
         "tf_chart": "5m", "min_risk": 0.0008, "sl_buffer": 0.0004,
+        "smt_pair": "XAGUSDT",  # Gold vs Silver
     },
     "NAS100USDT": {
         "symbol": "NAS100USDT", "label": "US100", "decimals": 1, "unit": "pts",
         "tf_chart": "5m", "min_risk": 0.001, "sl_buffer": 0.0005,
+        "smt_pair": None,  # no easy correlated pair on Binance
     },
 }
 
@@ -217,6 +220,77 @@ def shift_5m(bars5):
     return None, None, None
 
 
+def detect_smt(bars_main, bars_corr, direction, lookback=40):
+    """
+    SMT divergence vs correlated pair.
+    Bullish SMT: main makes lower low, correlated does NOT (higher low).
+    Bearish SMT: main makes higher high, correlated does NOT (lower high).
+    Returns dict for chart or None.
+    """
+    if not bars_corr or len(bars_corr) < lookback or len(bars_main) < lookback:
+        return None
+    n = min(len(bars_main), len(bars_corr), lookback)
+    m = bars_main[-n:]
+    c = bars_corr[-n:]
+    # find last two swing lows / highs on main
+    def swings(bars, mode="low", pivot=2):
+        out = []
+        for i in range(pivot, len(bars) - pivot):
+            if mode == "low":
+                if bars[i]["l"] == min(b["l"] for b in bars[i-pivot:i+pivot+1]):
+                    out.append((i, bars[i]["l"]))
+            else:
+                if bars[i]["h"] == max(b["h"] for b in bars[i-pivot:i+pivot+1]):
+                    out.append((i, bars[i]["h"]))
+        return out
+
+    if direction == "bull":
+        ms = swings(m, "low")
+        cs = swings(c, "low")
+        if len(ms) < 2 or len(cs) < 2:
+            return None
+        (i1, p1), (i2, p2) = ms[-2], ms[-1]
+        # main lower low
+        if p2 >= p1:
+            return None
+        # correlated should NOT make lower low
+        c1 = min((x[1] for x in cs if abs(x[0] - i1) <= 3), default=None)
+        c2 = min((x[1] for x in cs if abs(x[0] - i2) <= 3), default=None)
+        if c1 is None or c2 is None:
+            return None
+        if c2 < c1:  # correlated also lower low → no SMT
+            return None
+        # map indices back to full bars_main
+        off = len(bars_main) - n
+        return {
+            "p1": {"idx": off + i1, "price": p1},
+            "p2": {"idx": off + i2, "price": p2},
+            "side": "bull",
+        }
+    elif direction == "bear":
+        ms = swings(m, "high")
+        cs = swings(c, "high")
+        if len(ms) < 2 or len(cs) < 2:
+            return None
+        (i1, p1), (i2, p2) = ms[-2], ms[-1]
+        if p2 <= p1:
+            return None
+        c1 = max((x[1] for x in cs if abs(x[0] - i1) <= 3), default=None)
+        c2 = max((x[1] for x in cs if abs(x[0] - i2) <= 3), default=None)
+        if c1 is None or c2 is None:
+            return None
+        if c2 > c1:
+            return None
+        off = len(bars_main) - n
+        return {
+            "p1": {"idx": off + i1, "price": p1},
+            "p2": {"idx": off + i2, "price": p2},
+            "side": "bear",
+        }
+    return None
+
+
+
 def asia_status(bars5):
     now = datetime.now(timezone.utc)
     today = now.date()
@@ -319,7 +393,7 @@ def is_opposite_blocked(state, symbol, side, price, now_ts):
 
 
 def build_setup(side, lv, price, plan, bars5, asia, fvgs, shift_idx, extreme, cfg,
-                ocl=None, idm=None, qml=None, flips=None):
+                ocl=None, idm=None, qml=None, flips=None, smt=None):
     is_long = side == "long"
     kind = lv.get("kind", "V")
     label_map = {"V":"Classic V / H1 POI", "A":"Classic A / H1 POI",
@@ -360,6 +434,12 @@ def build_setup(side, lv, price, plan, bars5, asia, fvgs, shift_idx, extreme, cf
     if ocl: setup["ocl"] = {"idx": min(ocl["idx"], len(bars5)-1), "price": ocl["price"]}
     if idm: setup["idm"] = {"idx": idm["idx"], "price": idm["price"]}
     if qml: setup["qm"]  = {"idx": min(qml["idx"], len(bars5)-1), "price": qml["price"]}
+    if smt:
+        setup["smt"] = {
+            "p1": {"idx": min(smt["p1"]["idx"], len(bars5)-1), "price": smt["p1"]["price"]},
+            "p2": {"idx": min(smt["p2"]["idx"], len(bars5)-1), "price": smt["p2"]["price"]},
+            "pair": smt.get("pair", ""),
+        }
 
     extras = []
     if flips:
@@ -438,6 +518,15 @@ def scan_pair(cfg, state):
         print(f"[{label}] data error:", e)
         return 0
 
+    # correlated pair for SMT
+    bars_corr = None
+    smt_sym = cfg.get("smt_pair")
+    if smt_sym:
+        try:
+            bars_corr = klines(smt_sym, "5m", 300)
+        except Exception:
+            bars_corr = None
+
     if len(b5) < 50 or len(b1) < 50:
         print(f"[{label}] not enough bars")
         return 0
@@ -451,6 +540,11 @@ def scan_pair(cfg, state):
     flips   = detect_sbr_rbs(b1, pivs)
     qmls    = detect_qml(b1, PIVOT_1H)
     direction, brk, shift_idx = shift_5m(b5)   # "bull" / "bear" / None
+    smt_hit = None
+    if bars_corr is not None and direction:
+        smt_hit = detect_smt(b5, bars_corr, direction)
+        if smt_hit:
+            smt_hit["pair"] = f"{symbol} vs {smt_sym}"
     asia    = asia_status(b5)
     fvgs    = open_fvgs(b1)
     recent  = b5[-12:]
@@ -499,6 +593,8 @@ def scan_pair(cfg, state):
         ]
         if locked_side:
             reasons.append(f"Direction locked by 5m SHIFT → only {locked_side} allowed.")
+        if smt_hit:
+            reasons.append(f"SMT divergence: {smt_hit.get('pair', '')}.")
         if asia:
             if is_v and asia.get("swept_low"): reasons.append(f"Asia low {fmt(asia['low'],dec)} swept.")
             if not is_v and asia.get("swept_high"): reasons.append(f"Asia high {fmt(asia['high'],dec)} swept.")
@@ -541,7 +637,7 @@ def scan_pair(cfg, state):
                 nearest_qml = next((q for q in reversed(qmls) if (q.get("side")=="bull")==is_v), None)
                 setup = build_setup("long" if is_v else "short", lv, price, plan, b5, asia, fvgs,
                                     shift_idx, extreme, cfg, ocl=nearest_ocl, idm=idm,
-                                    qml=nearest_qml, flips=flips)
+                                    qml=nearest_qml, flips=flips, smt=smt_hit)
                 deliver(f"5M SHIFT {'UP' if is_v else 'DOWN'} {label} | {name}",
                         f"{plan['side'].upper()} entry {fmt(plan['entry'],dec)} SL {fmt(plan['sl'],dec)} "
                         f"TP1 {fmt(plan['tp1'],dec)} TP2 {fmt(plan['tp2'],dec)}",
